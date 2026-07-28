@@ -1,3 +1,4 @@
+use crate::notify::Notifier;
 use crate::paths;
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
@@ -27,13 +28,13 @@ enum Source {
 }
 
 /// Если запись уже идёт — остановить её, иначе начать новую.
-pub fn toggle() -> Result<()> {
+pub fn toggle(no_notify: bool) -> Result<()> {
     if let Some(pid) = running_recording()? {
         signal::kill(pid, Signal::SIGTERM).context("не удалось остановить запись")?;
         println!("Запись остановлена (pid {pid}).");
         return Ok(());
     }
-    record()
+    record(no_notify)
 }
 
 /// pid идущей записи, если она есть; заодно подчищает устаревший pid-файл.
@@ -118,7 +119,8 @@ fn mix(a: i16, b: i16) -> i16 {
     (a as i32 + b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-pub fn record() -> Result<()> {
+pub fn record(no_notify: bool) -> Result<()> {
+    let notifier = Notifier::new(no_notify);
     let wav_path = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
 
@@ -157,6 +159,7 @@ pub fn record() -> Result<()> {
         "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
         wav_path.display()
     );
+    notifier.send("⏺ Идёт запись встречи", &wav_path.display().to_string());
 
     mainloop.run();
 
@@ -168,6 +171,7 @@ pub fn record() -> Result<()> {
         .finalize()?;
 
     println!("Готово: {}", wav_path.display());
+    notifier.send("Готово", &wav_path.display().to_string());
     Ok(())
 }
 

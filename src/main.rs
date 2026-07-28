@@ -1,3 +1,4 @@
+mod notify;
 mod paths;
 mod record;
 mod transcribe;
@@ -16,9 +17,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Начать запись с микрофона (остановка: Ctrl+C или SIGTERM)
-    Record,
+    Record {
+        /// Не показывать desktop-уведомления
+        #[arg(long)]
+        no_notify: bool,
+    },
     /// Начать запись, либо остановить уже идущую (для горячей клавиши)
-    Toggle,
+    Toggle {
+        /// Не показывать desktop-уведомления
+        #[arg(long)]
+        no_notify: bool,
+    },
     /// Транскрибировать запись (по умолчанию — последнюю)
     Transcribe {
         /// Путь к WAV-файлу
@@ -37,8 +46,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Record => record::record(),
-        Command::Toggle => record::toggle(),
+        Command::Record { no_notify } => record::record(no_notify),
+        Command::Toggle { no_notify } => record::toggle(no_notify),
         Command::Transcribe { file, model, lang } => transcribe::transcribe(file, model, &lang),
         Command::List => list(),
     }
