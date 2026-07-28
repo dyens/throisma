@@ -6,7 +6,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub fn transcribe(file: Option<PathBuf>, model: Option<PathBuf>, lang: &str) -> Result<()> {
     let wav = match file {
         Some(f) => f,
-        None => latest_recording()?,
+        None => paths::latest_recording()?,
     };
     println!("Транскрибирую {} …", wav.display());
     let text = transcribe_wav(&wav, model, lang)?;
@@ -87,10 +87,4 @@ fn read_wav(wav: &Path) -> Result<Vec<f32>> {
         .samples::<i16>()
         .map(|s| s.map(|v| v as f32 / 32768.0).context("ошибка чтения WAV"))
         .collect()
-}
-
-fn latest_recording() -> Result<PathBuf> {
-    paths::recordings()?
-        .pop()
-        .context("записей нет — сначала выполните `throisma record`")
 }

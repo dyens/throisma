@@ -27,6 +27,13 @@ pub(crate) fn recordings() -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Последняя запись.
+pub(crate) fn latest_recording() -> Result<PathBuf> {
+    recordings()?
+        .pop()
+        .context("записей нет — сначала выполните `throisma record`")
+}
+
 /// Модель whisper по умолчанию.
 pub(crate) fn default_model() -> Result<PathBuf> {
     Ok(data_dir()?.join("models").join("ggml-base.bin"))

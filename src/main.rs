@@ -2,6 +2,7 @@ mod dictate;
 mod insert;
 mod notify;
 mod paths;
+mod play;
 mod record;
 mod transcribe;
 
@@ -53,6 +54,11 @@ enum Command {
         #[arg(short, long, default_value = "auto")]
         lang: String,
     },
+    /// Проиграть запись (по умолчанию — последнюю)
+    Play {
+        /// Путь к WAV-файлу
+        file: Option<PathBuf>,
+    },
     /// Показать список записей
     List,
 }
@@ -64,6 +70,7 @@ fn main() -> Result<()> {
         Command::Toggle { no_notify } => record::toggle(no_notify),
         Command::Dictate { model, lang, no_notify } => dictate::dictate(model, &lang, no_notify),
         Command::Transcribe { file, model, lang } => transcribe::transcribe(file, model, &lang),
+        Command::Play { file } => play::play(file),
         Command::List => list(),
     }
 }
