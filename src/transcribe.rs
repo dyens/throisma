@@ -42,7 +42,7 @@ pub(crate) fn transcribe_wav(wav: &Path, model: Option<PathBuf>, lang: &str) -> 
     let samples = read_wav(wav)?;
 
     // глушим болтливый лог whisper.cpp/ggml в stderr
-    whisper_rs::install_logging_hooks();
+    if std::env::var("THROISMA_DEBUG").is_err() { whisper_rs::install_logging_hooks(); }
     let ctx = WhisperContext::new_with_params(
         model.to_str().context("путь к модели содержит не-UTF-8 символы")?,
         WhisperContextParameters::default(),
