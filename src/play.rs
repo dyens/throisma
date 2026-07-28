@@ -1,7 +1,8 @@
 //! Воспроизведение записей.
 
 use crate::paths;
-use anyhow::{bail, Context, Result};
+use crate::proc;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -10,16 +11,10 @@ pub fn play(file: Option<PathBuf>) -> Result<()> {
         Some(f) => f,
         None => paths::latest_recording()?,
     };
-    if !wav.exists() {
-        bail!("файл не найден: {}", wav.display());
-    }
+    paths::require_exists(&wav)?;
     println!("Играю {} … (Ctrl+C — остановить)", wav.display());
-    let status = Command::new("pw-play")
-        .arg(&wav)
-        .status()
-        .context("не удалось запустить pw-play — установлен pipewire-utils?")?;
-    if !status.success() {
-        bail!("pw-play завершился с ошибкой");
-    }
+    let mut cmd = Command::new("pw-play");
+    cmd.arg(&wav);
+    proc::run(cmd, None).context("pw-play входит в pipewire-utils")?;
     Ok(())
 }

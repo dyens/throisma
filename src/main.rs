@@ -3,11 +3,12 @@ mod insert;
 mod notify;
 mod paths;
 mod play;
+mod proc;
 mod record;
 mod transcribe;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -15,44 +16,39 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Не показывать desktop-уведомления
+    #[arg(long, global = true)]
+    no_notify: bool,
+}
+
+/// Общие параметры транскрипции.
+#[derive(Args)]
+struct WhisperArgs {
+    /// Путь к ggml-модели whisper (или переменная THROISMA_MODEL)
+    #[arg(short, long)]
+    model: Option<PathBuf>,
+    /// Язык (auto — автоопределение)
+    #[arg(short, long, default_value = "auto")]
+    lang: String,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Начать запись с микрофона (остановка: Ctrl+C или SIGTERM)
-    Record {
-        /// Не показывать desktop-уведомления
-        #[arg(long)]
-        no_notify: bool,
-    },
+    Record,
     /// Начать запись, либо остановить уже идущую (для горячей клавиши)
-    Toggle {
-        /// Не показывать desktop-уведомления
-        #[arg(long)]
-        no_notify: bool,
-    },
+    Toggle,
     /// Диктовка: начать запись голоса, либо остановить и вставить текст (для горячей клавиши)
     Dictate {
-        /// Путь к ggml-модели whisper (или переменная THROISMA_MODEL)
-        #[arg(short, long)]
-        model: Option<PathBuf>,
-        /// Язык (auto — автоопределение)
-        #[arg(short, long, default_value = "auto")]
-        lang: String,
-        /// Не показывать desktop-уведомления
-        #[arg(long)]
-        no_notify: bool,
+        #[command(flatten)]
+        whisper: WhisperArgs,
     },
     /// Транскрибировать запись (по умолчанию — последнюю)
     Transcribe {
         /// Путь к WAV-файлу
         file: Option<PathBuf>,
-        /// Путь к ggml-модели whisper (или переменная THROISMA_MODEL)
-        #[arg(short, long)]
-        model: Option<PathBuf>,
-        /// Язык (auto — автоопределение)
-        #[arg(short, long, default_value = "auto")]
-        lang: String,
+        #[command(flatten)]
+        whisper: WhisperArgs,
     },
     /// Проиграть запись (по умолчанию — последнюю)
     Play {
@@ -66,10 +62,10 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Record { no_notify } => record::record(no_notify),
-        Command::Toggle { no_notify } => record::toggle(no_notify),
-        Command::Dictate { model, lang, no_notify } => dictate::dictate(model, &lang, no_notify),
-        Command::Transcribe { file, model, lang } => transcribe::transcribe(file, model, &lang),
+        Command::Record => record::record(cli.no_notify),
+        Command::Toggle => record::toggle(cli.no_notify),
+        Command::Dictate { whisper } => dictate::dictate(whisper.model, &whisper.lang, cli.no_notify),
+        Command::Transcribe { file, whisper } => transcribe::transcribe(file, whisper.model, &whisper.lang),
         Command::Play { file } => play::play(file),
         Command::List => list(),
     }

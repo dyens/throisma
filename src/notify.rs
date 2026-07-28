@@ -13,13 +13,14 @@ impl Notifier {
         Notifier { enabled: !no_notify && !env_off }
     }
 
-    /// Показывает уведомление; ошибки (нет notify-send и т.п.) молча игнорируются.
+    /// Показывает уведомление, не дожидаясь notify-send — вызывающие не должны
+    /// тормозить из-за D-Bus; ошибки (нет notify-send и т.п.) молча игнорируются.
     pub(crate) fn send(&self, summary: &str, body: &str) {
         if !self.enabled {
             return;
         }
         let _ = Command::new("notify-send")
             .args(["--app-name=throisma", summary, body])
-            .status();
+            .spawn();
     }
 }

@@ -1,7 +1,7 @@
 //! Все пути приложения в одном месте.
 
-use anyhow::{Context, Result};
-use std::path::PathBuf;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 
 /// ~/.local/share/throisma
 fn data_dir() -> Result<PathBuf> {
@@ -32,6 +32,14 @@ pub(crate) fn latest_recording() -> Result<PathBuf> {
     recordings()?
         .pop()
         .context("записей нет — сначала выполните `throisma record`")
+}
+
+/// Ошибка, если файла нет.
+pub(crate) fn require_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        bail!("файл не найден: {}", path.display());
+    }
+    Ok(())
 }
 
 /// Модель whisper по умолчанию.

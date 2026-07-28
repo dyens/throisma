@@ -6,7 +6,6 @@ use crate::paths;
 use crate::record::{self, Pidfile, RecordConfig};
 use crate::transcribe;
 use anyhow::{Context, Result};
-use nix::sys::signal::{self, Signal};
 use std::path::PathBuf;
 
 /// Текст без реальной речи: пусто или только маркеры whisper вида [BLANK_AUDIO], (music).
@@ -18,8 +17,9 @@ fn is_blank(text: &str) -> bool {
 
 /// Тогл: если диктовка идёт — остановить её, иначе начать новую.
 pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()> {
-    if let Some(pid) = record::running_recording(&paths::dictate_pidfile())? {
-        signal::kill(pid, Signal::SIGTERM).context("не удалось остановить диктовку")?;
+    if let Some(pid) =
+        record::stop_running(&paths::dictate_pidfile()).context("не удалось остановить диктовку")?
+    {
         println!("Диктовка остановлена (pid {pid}).");
         return Ok(());
     }
@@ -39,28 +39,27 @@ pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()
     })?;
 
     notifier.send("Транскрибирую…", "");
-    let result = transcribe::transcribe_wav(&wav, model, lang).and_then(|text| {
-        let text = text.trim().to_string();
-        if !is_blank(&text) {
-            insert::insert_text(&text)?;
-        }
-        Ok(text)
-    });
-    match result {
-        // тишина или только маркеры whisper: клипборд не трогаем, «Вставлено» не сообщаем
-        Ok(text) if is_blank(&text) => {
-            let _ = std::fs::remove_file(&wav);
+    let result = (|| -> Result<()> {
+        let text = transcribe::transcribe_wav(&wav, model, lang)?;
+        let text = text.trim();
+        if is_blank(text) {
+            // тишина или только маркеры whisper: клипборд не трогаем
             notifier.send("Речь не распознана", "Пустая транскрипция — ничего не вставлено");
             println!("Речь не распознана — ничего не вставлено.");
-            Ok(())
-        }
-        Ok(text) => {
-            let _ = std::fs::remove_file(&wav);
-            notifier.send("Вставлено", &preview(&text));
+        } else {
+            insert::insert_text(text)?;
+            notifier.send("Вставлено", &preview(text));
             println!("{text}");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&wav);
             Ok(())
         }
         Err(e) => {
+            // WAV намеренно остаётся — для повтора
             notifier.send(
                 "Ошибка диктовки",
                 &format!("{e:#}\nПовтор: throisma transcribe {}", wav.display()),

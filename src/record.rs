@@ -27,18 +27,36 @@ enum Source {
     SinkMonitor,
 }
 
+impl Source {
+    /// Номер дорожки в миксере.
+    fn track(self) -> usize {
+        match self {
+            Source::Mic => 0,
+            Source::SinkMonitor => 1,
+        }
+    }
+}
+
 /// Если запись уже идёт — остановить её, иначе начать новую.
 pub fn toggle(no_notify: bool) -> Result<()> {
-    if let Some(pid) = running_recording(&paths::pidfile())? {
-        signal::kill(pid, Signal::SIGTERM).context("не удалось остановить запись")?;
+    if let Some(pid) = stop_running(&paths::pidfile()).context("не удалось остановить запись")? {
         println!("Запись остановлена (pid {pid}).");
         return Ok(());
     }
     record(no_notify)
 }
 
+/// Шлёт SIGTERM процессу из pid-файла, если тот жив; возвращает его pid.
+pub(crate) fn stop_running(pidfile: &Path) -> Result<Option<Pid>> {
+    let Some(pid) = running_recording(pidfile)? else {
+        return Ok(None);
+    };
+    signal::kill(pid, Signal::SIGTERM)?;
+    Ok(Some(pid))
+}
+
 /// pid идущей записи, если она есть; заодно подчищает устаревший pid-файл.
-pub(crate) fn running_recording(pidfile: &Path) -> Result<Option<Pid>> {
+fn running_recording(pidfile: &Path) -> Result<Option<Pid>> {
     let Ok(contents) = std::fs::read_to_string(pidfile) else {
         return Ok(None);
     };
@@ -71,16 +89,16 @@ impl Drop for Pidfile {
     }
 }
 
-/// Копит сэмплы обеих дорожек и пишет их сумму в WAV по мере поступления.
+/// Копит дорожки (микрофон и, для встреч, системный звук) и пишет их сумму
+/// в WAV по мере поступления: очередной сэмпл уходит в файл, как только он
+/// есть во всех дорожках.
 struct Mixer {
-    mic: VecDeque<i16>,
-    sys: VecDeque<i16>,
-    mic_only: bool,
+    tracks: Vec<VecDeque<i16>>,
     writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
 }
 
 impl Mixer {
-    fn create(path: &Path, mic_only: bool) -> Result<Mixer> {
+    fn create(path: &Path, n_tracks: usize) -> Result<Mixer> {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: RATE,
@@ -88,43 +106,43 @@ impl Mixer {
             sample_format: hound::SampleFormat::Int,
         };
         Ok(Mixer {
-            mic: VecDeque::new(),
-            sys: VecDeque::new(),
-            mic_only,
+            tracks: vec![VecDeque::new(); n_tracks],
             writer: hound::WavWriter::create(path, spec)?,
         })
     }
 
-    fn push(&mut self, source: Source, samples: impl Iterator<Item = i16>) -> Result<()> {
-        if self.mic_only {
-            for s in samples {
-                self.writer.write_sample(s)?;
-            }
-            return Ok(());
-        }
-        match source {
-            Source::Mic => self.mic.extend(samples),
-            Source::SinkMonitor => self.sys.extend(samples),
-        }
-        let ready = self.mic.len().min(self.sys.len());
-        for (a, b) in self.mic.drain(..ready).zip(self.sys.drain(..ready)) {
-            self.writer.write_sample(mix(a, b))?;
+    fn push(&mut self, track: usize, samples: impl Iterator<Item = i16>) -> Result<()> {
+        self.tracks[track].extend(samples);
+        let ready = self.tracks.iter().map(VecDeque::len).min().unwrap_or(0);
+        for _ in 0..ready {
+            let sum: i32 = self
+                .tracks
+                .iter_mut()
+                .map(|q| q.pop_front().expect("длина проверена через ready") as i32)
+                .sum();
+            self.writer.write_sample(clamp(sum))?;
         }
         Ok(())
     }
 
-    /// Дописывает хвост более длинной дорожки и закрывает файл.
+    /// Дописывает несведённые хвосты дорожек и закрывает файл.
     fn finalize(mut self) -> Result<()> {
-        for s in self.mic.drain(..).chain(self.sys.drain(..)) {
-            self.writer.write_sample(s)?;
+        while self.tracks.iter().any(|q| !q.is_empty()) {
+            let sum: i32 = self
+                .tracks
+                .iter_mut()
+                .filter_map(VecDeque::pop_front)
+                .map(i32::from)
+                .sum();
+            self.writer.write_sample(clamp(sum))?;
         }
         self.writer.finalize()?;
         Ok(())
     }
 }
 
-fn mix(a: i16, b: i16) -> i16 {
-    (a as i32 + b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+fn clamp(sum: i32) -> i16 {
+    sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 /// Параметры одной записи.
@@ -160,7 +178,7 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None).context("не удалось подключиться к PipeWire")?;
 
-    let mixer = Rc::new(RefCell::new(Mixer::create(&cfg.wav, cfg.mic_only)?));
+    let mixer = Rc::new(RefCell::new(Mixer::create(&cfg.wav, if cfg.mic_only { 1 } else { 2 })?));
     let mic_stream = capture_stream(&core, Source::Mic, mixer.clone())?;
     let sys_stream = if cfg.mic_only {
         None
@@ -232,7 +250,7 @@ fn capture_stream<'c>(
             let samples = bytes[..n]
                 .chunks_exact(2)
                 .map(|c| i16::from_le_bytes([c[0], c[1]]));
-            if let Err(e) = mixer.borrow_mut().push(source, samples) {
+            if let Err(e) = mixer.borrow_mut().push(source.track(), samples) {
                 eprintln!("ошибка записи в WAV: {e}");
             }
         })

@@ -21,9 +21,7 @@ pub fn transcribe(file: Option<PathBuf>, model: Option<PathBuf>, lang: &str) -> 
 
 /// Транскрибирует WAV и возвращает текст (сегменты, разделённые \n).
 pub(crate) fn transcribe_wav(wav: &Path, model: Option<PathBuf>, lang: &str) -> Result<String> {
-    if !wav.exists() {
-        bail!("файл не найден: {}", wav.display());
-    }
+    paths::require_exists(wav)?;
 
     let model = match model.or_else(|| std::env::var("THROISMA_MODEL").ok().map(PathBuf::from)) {
         Some(m) => m,
