@@ -1,6 +1,6 @@
 use crate::paths;
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub fn transcribe(file: Option<PathBuf>, model: Option<PathBuf>, lang: &str) -> Result<()> {
@@ -8,6 +8,19 @@ pub fn transcribe(file: Option<PathBuf>, model: Option<PathBuf>, lang: &str) -> 
         Some(f) => f,
         None => latest_recording()?,
     };
+    println!("Транскрибирую {} …", wav.display());
+    let text = transcribe_wav(&wav, model, lang)?;
+
+    let txt = wav.with_extension("txt");
+    std::fs::write(&txt, &text)
+        .with_context(|| format!("не удалось записать {}", txt.display()))?;
+
+    println!("\nТранскрипт: {}", txt.display());
+    Ok(())
+}
+
+/// Транскрибирует WAV и возвращает текст (сегменты, разделённые \n).
+pub(crate) fn transcribe_wav(wav: &Path, model: Option<PathBuf>, lang: &str) -> Result<String> {
     if !wav.exists() {
         bail!("файл не найден: {}", wav.display());
     }
@@ -28,9 +41,8 @@ pub fn transcribe(file: Option<PathBuf>, model: Option<PathBuf>, lang: &str) -> 
         );
     }
 
-    let samples = read_wav(&wav)?;
+    let samples = read_wav(wav)?;
 
-    println!("Транскрибирую {} …", wav.display());
     // глушим болтливый лог whisper.cpp/ggml в stderr
     whisper_rs::install_logging_hooks();
     let ctx = WhisperContext::new_with_params(
@@ -54,17 +66,11 @@ pub fn transcribe(file: Option<PathBuf>, model: Option<PathBuf>, lang: &str) -> 
         text.push_str(&segment.to_str_lossy().context("не удалось прочитать сегмент")?);
         text.push('\n');
     }
-
-    let txt = wav.with_extension("txt");
-    std::fs::write(&txt, text.trim_start())
-        .with_context(|| format!("не удалось записать {}", txt.display()))?;
-
-    println!("\nТранскрипт: {}", txt.display());
-    Ok(())
+    Ok(text.trim_start().to_string())
 }
 
 // whisper принимает только 16 кГц моно f32; записи рекордера уже в этом формате
-fn read_wav(wav: &PathBuf) -> Result<Vec<f32>> {
+fn read_wav(wav: &Path) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(wav)
         .with_context(|| format!("не удалось открыть {}", wav.display()))?;
     let spec = reader.spec();
