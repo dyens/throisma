@@ -63,7 +63,7 @@ Pid-файл диктовки отдельный от pid-файла запис�
   команда `transcribe` пишет `.txt` как раньше, `dictate` берёт строку.
 - Новый `notify.rs` — обёртка над `notify-send` через `Command`, без новых
   крейтов.
-- Новый `insert.rs` — вставка текста: `wl-copy` (stdin) + `wtype` (аргумент).
+- Новый `insert.rs` — вставка текста: `wl-copy` (stdin) + `wtype` (stdin, `wtype -`).
 - `main.rs` — сабкоманда `Dictate`, флаги `--no-notify`.
 
 Новых зависимостей нет.

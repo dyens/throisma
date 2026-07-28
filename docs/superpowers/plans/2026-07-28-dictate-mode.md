@@ -251,8 +251,9 @@ git commit -m "Extract transcribe_wav returning text"
 **Interfaces:**
 - Consumes: `notify::Notifier` из Task 1.
 - Produces:
-  - `record::RecordConfig { wav: PathBuf, mic_only: bool, pidfile: PathBuf }` (все поля `pub(crate)`);
-  - `record::record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()>` — блокируется до SIGTERM/Ctrl+C, финализирует WAV; сам ничего не печатает и не уведомляет, но вызывает `on_started` после подключения стримов и создания pid-файла, прямо перед стартом цикла — чтобы «запись пошла» сообщалось только когда она реально идёт;
+  - `record::RecordConfig { wav: PathBuf, mic_only: bool }` (все поля `pub(crate)`); pid-файл в конфиг не входит — его создаёт и держит вызывающий (`record()`/`dictate()`), а не `record_to`;
+  - `record::record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()>` — блокируется до SIGTERM/Ctrl+C, финализирует WAV; сам ничего не печатает и не уведомляет и не создаёт pid-файл, но вызывает `on_started` после подключения стримов, прямо перед стартом цикла — чтобы «запись пошла» сообщалось только когда она реально идёт;
+  - `record::Pidfile` и `record::Pidfile::create(path: PathBuf) -> Result<Pidfile>` — теперь `pub(crate)`, чтобы `dictate()` тоже мог создавать и держать pid-файл (в т.ч. на время транскрипции и вставки, а не только записи);
   - `record::running_recording(pidfile: &Path) -> Result<Option<Pid>>` — теперь `pub(crate)` и с параметром;
   - `paths::runtime_dir() -> PathBuf` (`dirs::runtime_dir()` c fallback на temp).
 
@@ -280,31 +281,28 @@ pub(crate) struct RecordConfig {
     pub(crate) wav: PathBuf,
     /// Только микрофон (диктовка) или микрофон + системный звук (встречи).
     pub(crate) mic_only: bool,
-    pub(crate) pidfile: PathBuf,
 }
 
 pub fn record(no_notify: bool) -> Result<()> {
     let notifier = Notifier::new(no_notify);
     let wav = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
-    record_to(
-        &RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() },
-        || {
-            println!(
-                "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
-                wav.display()
-            );
-            notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
-        },
-    )?;
+    let _pidfile = Pidfile::create(paths::pidfile())?;
+    record_to(&RecordConfig { wav: wav.clone(), mic_only: false }, || {
+        println!(
+            "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
+            wav.display()
+        );
+        notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
+    })?;
     println!("Готово: {}", wav.display());
     notifier.send("Готово", &wav.display().to_string());
     Ok(())
 }
 
 /// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Сама молчалива: вывод — забота
-/// вызывающего; `on_started` вызывается, когда запись реально пошла
-/// (стримы подключены, pid-файл создан).
+/// вызывающего; pid-файл создаёт и держит вызывающий. `on_started`
+/// вызывается, когда запись реально пошла (стримы подключены).
 pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("PipeWire main loop")?;
@@ -340,7 +338,6 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
         .update_timer(Some(Duration::from_millis(100)), Some(Duration::from_millis(100)))
         .into_result()?;
 
-    let _pidfile = Pidfile::create(cfg.pidfile.clone())?;
     on_started();
     mainloop.run();
 
@@ -385,11 +382,18 @@ pub(crate) fn running_recording(pidfile: &Path) -> Result<Option<Pid>> {
 }
 ```
 
-`Pidfile::create` принимает путь:
+`Pidfile` и `Pidfile::create` — `pub(crate)` (создаёт и держит вызывающий:
+`record()` до конца функции, а в Task 4 — `dictate()` до конца функции, через
+транскрипцию и вставку):
 
 ```rust
+/// Гарантия «pid-файл существует, пока жив владелец» (записывающая и, для
+/// диктовки, транскрибирующая/вставляющая фаза): создаётся вызывающим и
+/// удаляется при выходе из scope.
+pub(crate) struct Pidfile(PathBuf);
+
 impl Pidfile {
-    fn create(path: PathBuf) -> Result<Pidfile> {
+    pub(crate) fn create(path: PathBuf) -> Result<Pidfile> {
         std::fs::write(&path, std::process::id().to_string())?;
         Ok(Pidfile(path))
     }
@@ -450,7 +454,7 @@ git commit -m "Parametrize recording: sources, output path, pidfile"
 - Modify: `src/main.rs` (сабкоманда Dictate, модули)
 
 **Interfaces:**
-- Consumes: `record::{record_to, running_recording, RecordConfig}` (Task 3; `record_to(cfg, on_started)` — колбэк вызывается, когда запись реально пошла), `transcribe::transcribe_wav` (Task 2), `notify::Notifier` (Task 1), `paths::runtime_dir` (Task 3).
+- Consumes: `record::{record_to, running_recording, RecordConfig, Pidfile}` (Task 3; `record_to(cfg, on_started)` — колбэк вызывается, когда запись реально пошла; `dictate()` сам создаёт `Pidfile` до вызова `record_to` и держит его до конца функции — через транскрипцию и вставку), `transcribe::transcribe_wav` (Task 2), `notify::Notifier` (Task 1), `paths::runtime_dir` (Task 3).
 - Produces: `dictate::dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()>`; `insert::insert_text(text: &str) -> Result<()>`.
 
 - [ ] **Step 1: `src/paths.rs` — пути диктовки**
@@ -512,11 +516,18 @@ fn pipe(cmd: &str, args: &[&str], input: &str) -> Result<()> {
 use crate::insert;
 use crate::notify::Notifier;
 use crate::paths;
-use crate::record::{self, RecordConfig};
+use crate::record::{self, Pidfile, RecordConfig};
 use crate::transcribe;
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
 use std::path::PathBuf;
+
+/// Текст без реальной речи: пусто или только маркеры whisper вида [BLANK_AUDIO], (music).
+fn is_blank(text: &str) -> bool {
+    text.split_whitespace().all(|w| {
+        (w.starts_with('[') && w.ends_with(']')) || (w.starts_with('(') && w.ends_with(')'))
+    })
+}
 
 /// Тогл: если диктовка идёт — остановить её, иначе начать новую.
 pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()> {
@@ -528,32 +539,29 @@ pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()
 
     let notifier = Notifier::new(no_notify);
     let wav = paths::dictate_wav();
-    record::record_to(
-        &RecordConfig {
-            wav: wav.clone(),
-            mic_only: true,
-            pidfile: paths::dictate_pidfile(),
-        },
-        || {
-            println!(
-                "Диктовка в {} — Ctrl+C или `throisma dictate` для остановки.",
-                wav.display()
-            );
-            notifier.send("🎤 Диктовка…", "Хоткей ещё раз — остановить и вставить текст");
-        },
-    )?;
+    // Держим pid-файл до конца функции (через транскрипцию и вставку) —
+    // повторный хоткей в этом окне шлёт SIGTERM живому процессу, а не
+    // запускает вторую запись поверх того же WAV.
+    let _pidfile = Pidfile::create(paths::dictate_pidfile())?;
+    record::record_to(&RecordConfig { wav: wav.clone(), mic_only: true }, || {
+        println!(
+            "Диктовка в {} — Ctrl+C или `throisma dictate` для остановки.",
+            wav.display()
+        );
+        notifier.send("🎤 Диктовка…", "Хоткей ещё раз — остановить и вставить текст");
+    })?;
 
     notifier.send("Транскрибирую…", "");
     let result = transcribe::transcribe_wav(&wav, model, lang).and_then(|text| {
         let text = text.trim().to_string();
-        if !text.is_empty() {
+        if !is_blank(&text) {
             insert::insert_text(&text)?;
         }
         Ok(text)
     });
     match result {
-        // тишина: клипборд не трогаем, «Вставлено» не сообщаем
-        Ok(text) if text.is_empty() => {
+        // тишина или только маркеры whisper: клипборд не трогаем, «Вставлено» не сообщаем
+        Ok(text) if is_blank(&text) => {
             let _ = std::fs::remove_file(&wav);
             notifier.send("Речь не распознана", "Пустая транскрипция — ничего не вставлено");
             println!("Речь не распознана — ничего не вставлено.");

@@ -53,12 +53,13 @@ pub(crate) fn running_recording(pidfile: &Path) -> Result<Option<Pid>> {
     Ok(None)
 }
 
-/// Гарантия «pid-файл существует, пока идёт запись»:
-/// создаётся на время записи, удаляется при выходе из scope.
-struct Pidfile(PathBuf);
+/// Гарантия «pid-файл существует, пока жив владелец» (записывающая и, для
+/// диктовки, транскрибирующая/вставляющая фаза): создаётся вызывающим и
+/// удаляется при выходе из scope.
+pub(crate) struct Pidfile(PathBuf);
 
 impl Pidfile {
-    fn create(path: PathBuf) -> Result<Pidfile> {
+    pub(crate) fn create(path: PathBuf) -> Result<Pidfile> {
         std::fs::write(&path, std::process::id().to_string())?;
         Ok(Pidfile(path))
     }
@@ -131,31 +132,28 @@ pub(crate) struct RecordConfig {
     pub(crate) wav: PathBuf,
     /// Только микрофон (диктовка) или микрофон + системный звук (встречи).
     pub(crate) mic_only: bool,
-    pub(crate) pidfile: PathBuf,
 }
 
 pub fn record(no_notify: bool) -> Result<()> {
     let notifier = Notifier::new(no_notify);
     let wav = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
-    record_to(
-        &RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() },
-        || {
-            println!(
-                "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
-                wav.display()
-            );
-            notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
-        },
-    )?;
+    let _pidfile = Pidfile::create(paths::pidfile())?;
+    record_to(&RecordConfig { wav: wav.clone(), mic_only: false }, || {
+        println!(
+            "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
+            wav.display()
+        );
+        notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
+    })?;
     println!("Готово: {}", wav.display());
     notifier.send("Готово", &wav.display().to_string());
     Ok(())
 }
 
 /// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Сама молчалива: вывод — забота
-/// вызывающего; `on_started` вызывается, когда запись реально пошла (стримы
-/// подключены, pid-файл создан).
+/// вызывающего; pid-файл создаёт и держит вызывающий. `on_started` вызывается,
+/// когда запись реально пошла (стримы подключены).
 pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("PipeWire main loop")?;
@@ -191,7 +189,6 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
         .update_timer(Some(Duration::from_millis(100)), Some(Duration::from_millis(100)))
         .into_result()?;
 
-    let _pidfile = Pidfile::create(cfg.pidfile.clone())?;
     on_started();
     mainloop.run();
 
