@@ -1,5 +1,6 @@
 mod dictate;
 mod insert;
+mod meta;
 mod notify;
 mod paths;
 mod play;
@@ -55,6 +56,13 @@ enum Command {
         /// Путь к WAV-файлу
         file: Option<PathBuf>,
     },
+    /// Назвать запись (по умолчанию — последнюю)
+    Rename {
+        /// Название
+        name: String,
+        /// Путь к WAV-файлу
+        file: Option<PathBuf>,
+    },
     /// Показать список записей
     List,
 }
@@ -67,6 +75,7 @@ fn main() -> Result<()> {
         Command::Dictate { whisper } => dictate::dictate(whisper.model, &whisper.lang, cli.no_notify),
         Command::Transcribe { file, whisper } => transcribe::transcribe(file, whisper.model, &whisper.lang),
         Command::Play { file } => play::play(file),
+        Command::Rename { name, file } => meta::rename(&name, file),
         Command::List => list(),
     }
 }
@@ -77,13 +86,17 @@ fn list() -> Result<()> {
         println!("Записей пока нет ({}).", paths::recordings_dir()?.display());
         return Ok(());
     }
+    let names = meta::load()?;
     for f in &files {
         let size_mb = f.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
         let has_txt = f.with_extension("txt").exists();
+        let stem = f.file_stem().unwrap().to_string_lossy();
+        let name = names.get(stem.as_ref()).map_or(String::new(), |m| format!("{}  ", m.name));
         println!(
-            "{}  {:>7.1} MB  {}",
+            "{}  {:>7.1} MB  {}{}",
             f.file_name().unwrap().to_string_lossy(),
             size_mb,
+            name,
             if has_txt { "[есть транскрипт]" } else { "" }
         );
     }
