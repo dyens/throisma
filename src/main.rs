@@ -26,9 +26,6 @@ enum Command {
         /// Путь к ggml-модели whisper (или переменная THROISMA_MODEL)
         #[arg(short, long)]
         model: Option<PathBuf>,
-        /// Бинарь whisper.cpp
-        #[arg(long, default_value = "whisper-cli")]
-        whisper_bin: String,
         /// Язык (auto — автоопределение)
         #[arg(short, long, default_value = "auto")]
         lang: String,
@@ -42,9 +39,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Record => record::record(),
         Command::Toggle => record::toggle(),
-        Command::Transcribe { file, model, whisper_bin, lang } => {
-            transcribe::transcribe(file, model, &whisper_bin, &lang)
-        }
+        Command::Transcribe { file, model, lang } => transcribe::transcribe(file, model, &lang),
         Command::List => list(),
     }
 }
