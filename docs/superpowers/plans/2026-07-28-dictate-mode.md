@@ -252,7 +252,7 @@ git commit -m "Extract transcribe_wav returning text"
 - Consumes: `notify::Notifier` из Task 1.
 - Produces:
   - `record::RecordConfig { wav: PathBuf, mic_only: bool, pidfile: PathBuf }` (все поля `pub(crate)`);
-  - `record::record_to(cfg: &RecordConfig) -> Result<()>` — блокируется до SIGTERM/Ctrl+C, финализирует WAV; ничего не печатает и не уведомляет;
+  - `record::record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()>` — блокируется до SIGTERM/Ctrl+C, финализирует WAV; сам ничего не печатает и не уведомляет, но вызывает `on_started` после подключения стримов и создания pid-файла, прямо перед стартом цикла — чтобы «запись пошла» сообщалось только когда она реально идёт;
   - `record::running_recording(pidfile: &Path) -> Result<Option<Pid>>` — теперь `pub(crate)` и с параметром;
   - `paths::runtime_dir() -> PathBuf` (`dirs::runtime_dir()` c fallback на temp).
 
@@ -287,19 +287,25 @@ pub fn record(no_notify: bool) -> Result<()> {
     let notifier = Notifier::new(no_notify);
     let wav = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
-    println!(
-        "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
-        wav.display()
-    );
-    notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
-    record_to(&RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() })?;
+    record_to(
+        &RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() },
+        || {
+            println!(
+                "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
+                wav.display()
+            );
+            notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
+        },
+    )?;
     println!("Готово: {}", wav.display());
     notifier.send("Готово", &wav.display().to_string());
     Ok(())
 }
 
-/// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Молчалива: вывод — забота вызывающего.
-pub(crate) fn record_to(cfg: &RecordConfig) -> Result<()> {
+/// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Сама молчалива: вывод — забота
+/// вызывающего; `on_started` вызывается, когда запись реально пошла
+/// (стримы подключены, pid-файл создан).
+pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("PipeWire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -335,6 +341,7 @@ pub(crate) fn record_to(cfg: &RecordConfig) -> Result<()> {
         .into_result()?;
 
     let _pidfile = Pidfile::create(cfg.pidfile.clone())?;
+    on_started();
     mainloop.run();
 
     // стримы держат клоны mixer — отпускаем их, чтобы забрать его целиком
@@ -443,7 +450,7 @@ git commit -m "Parametrize recording: sources, output path, pidfile"
 - Modify: `src/main.rs` (сабкоманда Dictate, модули)
 
 **Interfaces:**
-- Consumes: `record::{record_to, running_recording, RecordConfig}` (Task 3), `transcribe::transcribe_wav` (Task 2), `notify::Notifier` (Task 1), `paths::runtime_dir` (Task 3).
+- Consumes: `record::{record_to, running_recording, RecordConfig}` (Task 3; `record_to(cfg, on_started)` — колбэк вызывается, когда запись реально пошла), `transcribe::transcribe_wav` (Task 2), `notify::Notifier` (Task 1), `paths::runtime_dir` (Task 3).
 - Produces: `dictate::dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()>`; `insert::insert_text(text: &str) -> Result<()>`.
 
 - [ ] **Step 1: `src/paths.rs` — пути диктовки**
@@ -521,16 +528,20 @@ pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()
 
     let notifier = Notifier::new(no_notify);
     let wav = paths::dictate_wav();
-    println!(
-        "Диктовка в {} — Ctrl+C или `throisma dictate` для остановки.",
-        wav.display()
-    );
-    notifier.send("🎤 Диктовка…", "Хоткей ещё раз — остановить и вставить текст");
-    record::record_to(&RecordConfig {
-        wav: wav.clone(),
-        mic_only: true,
-        pidfile: paths::dictate_pidfile(),
-    })?;
+    record::record_to(
+        &RecordConfig {
+            wav: wav.clone(),
+            mic_only: true,
+            pidfile: paths::dictate_pidfile(),
+        },
+        || {
+            println!(
+                "Диктовка в {} — Ctrl+C или `throisma dictate` для остановки.",
+                wav.display()
+            );
+            notifier.send("🎤 Диктовка…", "Хоткей ещё раз — остановить и вставить текст");
+        },
+    )?;
 
     notifier.send("Транскрибирую…", "");
     let result = transcribe::transcribe_wav(&wav, model, lang).and_then(|text| {
