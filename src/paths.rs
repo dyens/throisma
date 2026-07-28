@@ -32,9 +32,12 @@ pub(crate) fn default_model() -> Result<PathBuf> {
     Ok(data_dir()?.join("models").join("ggml-base.bin"))
 }
 
+/// $XDG_RUNTIME_DIR (fallback — временный каталог).
+pub(crate) fn runtime_dir() -> PathBuf {
+    dirs::runtime_dir().unwrap_or_else(std::env::temp_dir)
+}
+
 /// pid-файл идущей записи.
 pub(crate) fn pidfile() -> PathBuf {
-    dirs::runtime_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("throisma.pid")
+    runtime_dir().join("throisma.pid")
 }

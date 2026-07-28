@@ -9,7 +9,7 @@ use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::Pod;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,7 +29,7 @@ enum Source {
 
 /// Если запись уже идёт — остановить её, иначе начать новую.
 pub fn toggle(no_notify: bool) -> Result<()> {
-    if let Some(pid) = running_recording()? {
+    if let Some(pid) = running_recording(&paths::pidfile())? {
         signal::kill(pid, Signal::SIGTERM).context("не удалось остановить запись")?;
         println!("Запись остановлена (pid {pid}).");
         return Ok(());
@@ -38,8 +38,8 @@ pub fn toggle(no_notify: bool) -> Result<()> {
 }
 
 /// pid идущей записи, если она есть; заодно подчищает устаревший pid-файл.
-fn running_recording() -> Result<Option<Pid>> {
-    let Ok(contents) = std::fs::read_to_string(paths::pidfile()) else {
+pub(crate) fn running_recording(pidfile: &Path) -> Result<Option<Pid>> {
+    let Ok(contents) = std::fs::read_to_string(pidfile) else {
         return Ok(None);
     };
     let pid = contents.trim().parse::<i32>().map(Pid::from_raw);
@@ -49,7 +49,7 @@ fn running_recording() -> Result<Option<Pid>> {
             return Ok(Some(pid));
         }
     }
-    let _ = std::fs::remove_file(paths::pidfile());
+    let _ = std::fs::remove_file(pidfile);
     Ok(None)
 }
 
@@ -58,8 +58,7 @@ fn running_recording() -> Result<Option<Pid>> {
 struct Pidfile(PathBuf);
 
 impl Pidfile {
-    fn create() -> Result<Pidfile> {
-        let path = paths::pidfile();
+    fn create(path: PathBuf) -> Result<Pidfile> {
         std::fs::write(&path, std::process::id().to_string())?;
         Ok(Pidfile(path))
     }
@@ -75,11 +74,12 @@ impl Drop for Pidfile {
 struct Mixer {
     mic: VecDeque<i16>,
     sys: VecDeque<i16>,
+    mic_only: bool,
     writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
 }
 
 impl Mixer {
-    fn create(path: &std::path::Path) -> Result<Mixer> {
+    fn create(path: &Path, mic_only: bool) -> Result<Mixer> {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: RATE,
@@ -89,11 +89,18 @@ impl Mixer {
         Ok(Mixer {
             mic: VecDeque::new(),
             sys: VecDeque::new(),
+            mic_only,
             writer: hound::WavWriter::create(path, spec)?,
         })
     }
 
     fn push(&mut self, source: Source, samples: impl Iterator<Item = i16>) -> Result<()> {
+        if self.mic_only {
+            for s in samples {
+                self.writer.write_sample(s)?;
+            }
+            return Ok(());
+        }
         match source {
             Source::Mic => self.mic.extend(samples),
             Source::SinkMonitor => self.sys.extend(samples),
@@ -119,19 +126,43 @@ fn mix(a: i16, b: i16) -> i16 {
     (a as i32 + b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
+/// Параметры одной записи.
+pub(crate) struct RecordConfig {
+    pub(crate) wav: PathBuf,
+    /// Только микрофон (диктовка) или микрофон + системный звук (встречи).
+    pub(crate) mic_only: bool,
+    pub(crate) pidfile: PathBuf,
+}
+
 pub fn record(no_notify: bool) -> Result<()> {
     let notifier = Notifier::new(no_notify);
-    let wav_path = paths::recordings_dir()?
+    let wav = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
+    println!(
+        "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
+        wav.display()
+    );
+    notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
+    record_to(&RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() })?;
+    println!("Готово: {}", wav.display());
+    notifier.send("Готово", &wav.display().to_string());
+    Ok(())
+}
 
+/// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Молчалива: вывод — забота вызывающего.
+pub(crate) fn record_to(cfg: &RecordConfig) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("PipeWire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None).context("не удалось подключиться к PipeWire")?;
 
-    let mixer = Rc::new(RefCell::new(Mixer::create(&wav_path)?));
+    let mixer = Rc::new(RefCell::new(Mixer::create(&cfg.wav, cfg.mic_only)?));
     let mic_stream = capture_stream(&core, Source::Mic, mixer.clone())?;
-    let sys_stream = capture_stream(&core, Source::SinkMonitor, mixer.clone())?;
+    let sys_stream = if cfg.mic_only {
+        None
+    } else {
+        Some(capture_stream(&core, Source::SinkMonitor, mixer.clone())?)
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
@@ -154,13 +185,7 @@ pub fn record(no_notify: bool) -> Result<()> {
         .update_timer(Some(Duration::from_millis(100)), Some(Duration::from_millis(100)))
         .into_result()?;
 
-    let _pidfile = Pidfile::create()?;
-    println!(
-        "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
-        wav_path.display()
-    );
-    notifier.send("⏺ Идёт запись встречи", &wav_path.display().to_string());
-
+    let _pidfile = Pidfile::create(cfg.pidfile.clone())?;
     mainloop.run();
 
     // стримы держат клоны mixer — отпускаем их, чтобы забрать его целиком
@@ -168,11 +193,7 @@ pub fn record(no_notify: bool) -> Result<()> {
     Rc::try_unwrap(mixer)
         .map_err(|_| anyhow::anyhow!("mixer всё ещё используется"))?
         .into_inner()
-        .finalize()?;
-
-    println!("Готово: {}", wav_path.display());
-    notifier.send("Готово", &wav_path.display().to_string());
-    Ok(())
+        .finalize()
 }
 
 type StreamHandle<'c> = (pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>);
