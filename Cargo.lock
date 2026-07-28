@@ -845,6 +845,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "hound",
+ "nix",
  "pipewire",
 ]
 

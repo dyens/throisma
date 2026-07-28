@@ -1,4 +1,7 @@
+use crate::paths;
 use anyhow::{Context, Result};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use pipewire as pw;
 use pw::spa;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
@@ -6,7 +9,6 @@ use spa::pod::Pod;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,26 +17,57 @@ use std::time::Duration;
 /// Пишем сразу в формате whisper: 16 кГц, моно, s16 — ресемплит сам PipeWire.
 const RATE: u32 = 16_000;
 
-fn pidfile() -> PathBuf {
-    dirs::runtime_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("throisma.pid")
+/// Откуда захватываем звук.
+#[derive(Clone, Copy)]
+enum Source {
+    /// Дефолтный микрофон.
+    Mic,
+    /// Monitor дефолтного аудиовыхода — то, что слышно в колонках (собеседники).
+    SinkMonitor,
 }
 
 /// Если запись уже идёт — остановить её, иначе начать новую.
 pub fn toggle() -> Result<()> {
-    let pidfile = pidfile();
-    if let Ok(pid) = std::fs::read_to_string(&pidfile) {
-        let pid = pid.trim().to_string();
-        if PathBuf::from(format!("/proc/{pid}")).exists() {
-            Command::new("kill").arg(&pid).status()?;
-            println!("Запись остановлена (pid {pid}).");
-            return Ok(());
-        }
-        // процесс умер, а pid-файл остался
-        let _ = std::fs::remove_file(&pidfile);
+    if let Some(pid) = running_recording()? {
+        signal::kill(pid, Signal::SIGTERM).context("не удалось остановить запись")?;
+        println!("Запись остановлена (pid {pid}).");
+        return Ok(());
     }
     record()
+}
+
+/// pid идущей записи, если она есть; заодно подчищает устаревший pid-файл.
+fn running_recording() -> Result<Option<Pid>> {
+    let Ok(contents) = std::fs::read_to_string(paths::pidfile()) else {
+        return Ok(None);
+    };
+    let pid = contents.trim().parse::<i32>().map(Pid::from_raw);
+    // сигнал 0 — проверка, что процесс жив
+    if let Ok(pid) = pid {
+        if signal::kill(pid, None).is_ok() {
+            return Ok(Some(pid));
+        }
+    }
+    let _ = std::fs::remove_file(paths::pidfile());
+    Ok(None)
+}
+
+/// Гарантия «pid-файл существует, пока идёт запись»:
+/// создаётся на время записи, удаляется при выходе из scope.
+struct Pidfile(PathBuf);
+
+impl Pidfile {
+    fn create() -> Result<Pidfile> {
+        let path = paths::pidfile();
+        std::fs::write(&path, std::process::id().to_string())?;
+        Ok(Pidfile(path))
+    }
+}
+
+impl Drop for Pidfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Копит сэмплы обеих дорожек и пишет их сумму в WAV по мере поступления.
@@ -45,15 +78,27 @@ struct Mixer {
 }
 
 impl Mixer {
-    fn push(&mut self, from_mic: bool, samples: &[i16]) -> Result<()> {
-        if from_mic {
-            self.mic.extend(samples);
-        } else {
-            self.sys.extend(samples);
+    fn create(path: &std::path::Path) -> Result<Mixer> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        Ok(Mixer {
+            mic: VecDeque::new(),
+            sys: VecDeque::new(),
+            writer: hound::WavWriter::create(path, spec)?,
+        })
+    }
+
+    fn push(&mut self, source: Source, samples: impl Iterator<Item = i16>) -> Result<()> {
+        match source {
+            Source::Mic => self.mic.extend(samples),
+            Source::SinkMonitor => self.sys.extend(samples),
         }
-        while !self.mic.is_empty() && !self.sys.is_empty() {
-            let a = self.mic.pop_front().unwrap();
-            let b = self.sys.pop_front().unwrap();
+        let ready = self.mic.len().min(self.sys.len());
+        for (a, b) in self.mic.drain(..ready).zip(self.sys.drain(..ready)) {
             self.writer.write_sample(mix(a, b))?;
         }
         Ok(())
@@ -74,7 +119,7 @@ fn mix(a: i16, b: i16) -> i16 {
 }
 
 pub fn record() -> Result<()> {
-    let final_path = crate::recordings_dir()?
+    let wav_path = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
 
     pw::init();
@@ -82,25 +127,15 @@ pub fn record() -> Result<()> {
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None).context("не удалось подключиться к PipeWire")?;
 
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mixer = Rc::new(RefCell::new(Mixer {
-        mic: VecDeque::new(),
-        sys: VecDeque::new(),
-        writer: hound::WavWriter::create(&final_path, spec)?,
-    }));
-
-    // микрофон — дефолтный источник; собеседники — monitor дефолтного выхода
-    let _mic = capture_stream(&core, "throisma-mic", false, mixer.clone())?;
-    let _sys = capture_stream(&core, "throisma-sys", true, mixer.clone())?;
+    let mixer = Rc::new(RefCell::new(Mixer::create(&wav_path)?));
+    let mic_stream = capture_stream(&core, Source::Mic, mixer.clone())?;
+    let sys_stream = capture_stream(&core, Source::SinkMonitor, mixer.clone())?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = stop.clone();
-    ctrlc::set_handler(move || stop2.store(true, Ordering::SeqCst))?;
+    ctrlc::set_handler({
+        let stop = stop.clone();
+        move || stop.store(true, Ordering::SeqCst)
+    })?;
 
     // pipewire-цикл нельзя прервать из обработчика сигнала напрямую —
     // раз в 100 мс проверяем флаг остановки таймером внутри цикла
@@ -117,24 +152,22 @@ pub fn record() -> Result<()> {
         .update_timer(Some(Duration::from_millis(100)), Some(Duration::from_millis(100)))
         .into_result()?;
 
-    let pidfile = pidfile();
-    std::fs::write(&pidfile, std::process::id().to_string())?;
-
+    let _pidfile = Pidfile::create()?;
     println!(
         "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
-        final_path.display()
+        wav_path.display()
     );
 
     mainloop.run();
 
-    drop((_mic, _sys));
-    let _ = std::fs::remove_file(&pidfile);
+    // стримы держат клоны mixer — отпускаем их, чтобы забрать его целиком
+    drop((mic_stream, sys_stream));
     Rc::try_unwrap(mixer)
         .map_err(|_| anyhow::anyhow!("mixer всё ещё используется"))?
         .into_inner()
         .finalize()?;
 
-    println!("Готово: {}", final_path.display());
+    println!("Готово: {}", wav_path.display());
     Ok(())
 }
 
@@ -142,8 +175,7 @@ type StreamHandle<'c> = (pw::stream::StreamBox<'c>, pw::stream::StreamListener<(
 
 fn capture_stream<'c>(
     core: &'c pw::core::CoreRc,
-    name: &str,
-    capture_sink: bool,
+    source: Source,
     mixer: Rc<RefCell<Mixer>>,
 ) -> Result<StreamHandle<'c>> {
     let mut props = pw::properties::properties! {
@@ -151,9 +183,13 @@ fn capture_stream<'c>(
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Communication",
     };
-    if capture_sink {
-        props.insert("stream.capture.sink", "true");
-    }
+    let name = match source {
+        Source::Mic => "throisma-mic",
+        Source::SinkMonitor => {
+            props.insert("stream.capture.sink", "true");
+            "throisma-sys"
+        }
+    };
 
     let stream = pw::stream::StreamBox::new(core, name, props)?;
     let listener = stream
@@ -164,33 +200,17 @@ fn capture_stream<'c>(
             let Some(data) = datas.first_mut() else { return };
             let n = data.chunk().size() as usize;
             let Some(bytes) = data.data() else { return };
-            let samples: Vec<i16> = bytes[..n]
+            let samples = bytes[..n]
                 .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            if let Err(e) = mixer.borrow_mut().push(!capture_sink, &samples) {
+                .map(|c| i16::from_le_bytes([c[0], c[1]]));
+            if let Err(e) = mixer.borrow_mut().push(source, samples) {
                 eprintln!("ошибка записи в WAV: {e}");
             }
         })
         .register()?;
 
-    let mut info = AudioInfoRaw::new();
-    info.set_format(AudioFormat::S16LE);
-    info.set_rate(RATE);
-    info.set_channels(1);
-    let pod_bytes = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &spa::pod::Value::Object(spa::pod::Object {
-            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-            id: spa::param::ParamType::EnumFormat.as_raw(),
-            properties: info.into(),
-        }),
-    )
-    .expect("сериализация формата")
-    .0
-    .into_inner();
-    let mut params = [Pod::from_bytes(&pod_bytes).unwrap()];
-
+    let pod_bytes = whisper_format_pod();
+    let mut params = [Pod::from_bytes(&pod_bytes).context("некорректный format pod")?];
     stream.connect(
         spa::utils::Direction::Input,
         None,
@@ -198,4 +218,23 @@ fn capture_stream<'c>(
         &mut params,
     )?;
     Ok((stream, listener))
+}
+
+/// SPA-параметр «отдавайте 16 кГц моно s16» для подключения стрима.
+fn whisper_format_pod() -> Vec<u8> {
+    let mut info = AudioInfoRaw::new();
+    info.set_format(AudioFormat::S16LE);
+    info.set_rate(RATE);
+    info.set_channels(1);
+    spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+            id: spa::param::ParamType::EnumFormat.as_raw(),
+            properties: info.into(),
+        }),
+    )
+    .expect("сериализация формата в память не падает")
+    .0
+    .into_inner()
 }

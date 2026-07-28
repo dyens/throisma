@@ -1,3 +1,4 @@
+use crate::paths;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,9 +17,10 @@ pub fn transcribe(
         bail!("файл не найден: {}", wav.display());
     }
 
-    let model = model
-        .or_else(|| std::env::var("THROISMA_MODEL").ok().map(PathBuf::from))
-        .unwrap_or_else(default_model_path);
+    let model = match model.or_else(|| std::env::var("THROISMA_MODEL").ok().map(PathBuf::from)) {
+        Some(m) => m,
+        None => paths::default_model()?,
+    };
     if !model.exists() {
         bail!(
             "модель не найдена: {}\n\
@@ -26,8 +28,8 @@ pub fn transcribe(
              mkdir -p {} && curl -L -o {} \\\n\
              https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
             model.display(),
-            default_model_path().parent().unwrap().display(),
-            default_model_path().display(),
+            model.parent().unwrap_or(&model).display(),
+            model.display(),
         );
     }
 
@@ -47,26 +49,12 @@ pub fn transcribe(
         bail!("{whisper_bin} завершился с ошибкой");
     }
 
-    let txt = out_base.with_extension("txt");
-    println!("\nТранскрипт: {}", txt.display());
+    println!("\nТранскрипт: {}", out_base.with_extension("txt").display());
     Ok(())
 }
 
-fn default_model_path() -> PathBuf {
-    dirs::data_dir()
-        .expect("не удалось определить каталог данных")
-        .join("throisma")
-        .join("models")
-        .join("ggml-base.bin")
-}
-
 fn latest_recording() -> Result<PathBuf> {
-    let dir = crate::recordings_dir()?;
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "wav"))
-        .collect();
-    files.sort();
-    files.pop().context("записей нет — сначала выполните `throisma record`")
+    paths::recordings()?
+        .pop()
+        .context("записей нет — сначала выполните `throisma record`")
 }
