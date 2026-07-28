@@ -47,6 +47,16 @@ pub(crate) fn default_model() -> Result<PathBuf> {
     Ok(data_dir()?.join("models").join("ggml-base.bin"))
 }
 
+/// Модель VAD (silero): если файл есть, тишина вырезается до распознавания.
+pub(crate) fn vad_model() -> Result<PathBuf> {
+    Ok(data_dir()?.join("models").join("ggml-silero-v5.1.2.bin"))
+}
+
+/// Словарь-подсказка для whisper: термины, которые модель иначе калечит.
+pub(crate) fn prompt_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("prompt.txt"))
+}
+
 /// $XDG_RUNTIME_DIR (fallback — временный каталог).
 pub(crate) fn runtime_dir() -> PathBuf {
     dirs::runtime_dir().unwrap_or_else(std::env::temp_dir)

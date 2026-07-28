@@ -16,7 +16,12 @@ fn is_blank(text: &str) -> bool {
 }
 
 /// Тогл: если диктовка идёт — остановить её, иначе начать новую.
-pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()> {
+pub fn dictate(
+    model: Option<PathBuf>,
+    lang: &str,
+    prompt: Option<&str>,
+    no_notify: bool,
+) -> Result<()> {
     if let Some(pid) =
         record::stop_running(&paths::dictate_pidfile()).context("не удалось остановить диктовку")?
     {
@@ -40,7 +45,7 @@ pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()
 
     notifier.send("Транскрибирую…", "");
     let result = (|| -> Result<()> {
-        let text = transcribe::transcribe_wav(&wav, model, lang)?;
+        let text = transcribe::transcribe_wav(&wav, model, lang, prompt)?;
         let text = text.trim();
         if is_blank(text) {
             // тишина или только маркеры whisper: клипборд не трогаем

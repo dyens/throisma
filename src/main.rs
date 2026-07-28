@@ -31,6 +31,9 @@ struct WhisperArgs {
     /// Язык (auto — автоопределение)
     #[arg(short, long, default_value = "auto")]
     lang: String,
+    /// Словарь-подсказка (по умолчанию — файл prompt.txt в каталоге данных)
+    #[arg(short, long)]
+    prompt: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -72,8 +75,12 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Record => record::record(cli.no_notify),
         Command::Toggle => record::toggle(cli.no_notify),
-        Command::Dictate { whisper } => dictate::dictate(whisper.model, &whisper.lang, cli.no_notify),
-        Command::Transcribe { file, whisper } => transcribe::transcribe(file, whisper.model, &whisper.lang),
+        Command::Dictate { whisper } => {
+            dictate::dictate(whisper.model, &whisper.lang, whisper.prompt.as_deref(), cli.no_notify)
+        }
+        Command::Transcribe { file, whisper } => {
+            transcribe::transcribe(file, whisper.model, &whisper.lang, whisper.prompt.as_deref())
+        }
         Command::Play { file } => play::play(file),
         Command::Rename { name, file } => meta::rename(&name, file),
         Command::List => list(),
