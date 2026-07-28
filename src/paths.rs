@@ -41,3 +41,14 @@ pub(crate) fn runtime_dir() -> PathBuf {
 pub(crate) fn pidfile() -> PathBuf {
     runtime_dir().join("throisma.pid")
 }
+
+/// pid-файл идущей диктовки (отдельный от записи встреч).
+pub(crate) fn dictate_pidfile() -> PathBuf {
+    runtime_dir().join("throisma-dictate.pid")
+}
+
+/// Временный WAV диктовки. Имя фиксированное: одновременная диктовка одна
+/// (это гарантирует pid-файл), а при ошибке файл остаётся для повтора.
+pub(crate) fn dictate_wav() -> PathBuf {
+    runtime_dir().join("throisma-dictate.wav")
+}

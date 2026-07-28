@@ -1,3 +1,5 @@
+mod dictate;
+mod insert;
 mod notify;
 mod paths;
 mod record;
@@ -28,6 +30,18 @@ enum Command {
         #[arg(long)]
         no_notify: bool,
     },
+    /// Диктовка: начать запись голоса, либо остановить и вставить текст (для горячей клавиши)
+    Dictate {
+        /// Путь к ggml-модели whisper (или переменная THROISMA_MODEL)
+        #[arg(short, long)]
+        model: Option<PathBuf>,
+        /// Язык (auto — автоопределение)
+        #[arg(short, long, default_value = "auto")]
+        lang: String,
+        /// Не показывать desktop-уведомления
+        #[arg(long)]
+        no_notify: bool,
+    },
     /// Транскрибировать запись (по умолчанию — последнюю)
     Transcribe {
         /// Путь к WAV-файлу
@@ -48,6 +62,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Record { no_notify } => record::record(no_notify),
         Command::Toggle { no_notify } => record::toggle(no_notify),
+        Command::Dictate { model, lang, no_notify } => dictate::dictate(model, &lang, no_notify),
         Command::Transcribe { file, model, lang } => transcribe::transcribe(file, model, &lang),
         Command::List => list(),
     }
