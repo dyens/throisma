@@ -5,10 +5,12 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use pipewire as pw;
 use pw::spa;
+use pw::types::ObjectType;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::Pod;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,8 +25,8 @@ const RATE: u32 = 16_000;
 enum Source {
     /// Дефолтный микрофон.
     Mic,
-    /// Monitor дефолтного аудиовыхода — то, что слышно в колонках (собеседники).
-    SinkMonitor,
+    /// Monitor одного из аудиовыходов (индекс дорожки в миксере).
+    SinkMonitor(usize),
 }
 
 /// Если запись уже идёт — остановить её, иначе начать новую.
@@ -71,60 +73,84 @@ impl Drop for Pidfile {
     }
 }
 
-/// Копит сэмплы обеих дорожек и пишет их сумму в WAV по мере поступления.
-struct Mixer {
-    mic: VecDeque<i16>,
-    sys: VecDeque<i16>,
-    mic_only: bool,
-    writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+/// Сводит микрофон и мониторы всех аудиовыходов в один моно-поток.
+///
+/// Часы задаёт микрофон: его сэмплы пишутся сразу, к каждому подмешиваются
+/// головы очередей мониторов (пустая очередь — тишина). Ждать данных от всех
+/// дорожек нельзя: монитор бездействующего (suspended) выхода не производит
+/// сэмплов вообще и застопорил бы запись.
+struct Mixer<W: Write + Seek> {
+    sys: Vec<VecDeque<i16>>,
+    writer: hound::WavWriter<W>,
 }
 
-impl Mixer {
-    fn create(path: &Path, mic_only: bool) -> Result<Mixer> {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: RATE,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        Ok(Mixer {
-            mic: VecDeque::new(),
-            sys: VecDeque::new(),
-            mic_only,
-            writer: hound::WavWriter::create(path, spec)?,
-        })
+/// Мониторы живут на своих часах и могут опережать микрофон — храним не
+/// больше двух секунд, лишнее отбрасываем с головы очереди.
+const SYS_QUEUE_CAP: usize = 2 * RATE as usize;
+
+fn wav_spec() -> hound::WavSpec {
+    hound::WavSpec {
+        channels: 1,
+        sample_rate: RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    }
+}
+
+/// Миксер, пишущий в файл (как в реальной записи).
+type FileMixer = Mixer<std::io::BufWriter<std::fs::File>>;
+
+impl FileMixer {
+    fn create(path: &Path, n_sinks: usize) -> Result<FileMixer> {
+        Ok(Mixer::new(hound::WavWriter::create(path, wav_spec())?, n_sinks))
+    }
+}
+
+impl<W: Write + Seek> Mixer<W> {
+    fn new(writer: hound::WavWriter<W>, n_sinks: usize) -> Mixer<W> {
+        Mixer { sys: vec![VecDeque::new(); n_sinks], writer }
     }
 
     fn push(&mut self, source: Source, samples: impl Iterator<Item = i16>) -> Result<()> {
-        if self.mic_only {
-            for s in samples {
-                self.writer.write_sample(s)?;
-            }
-            return Ok(());
-        }
         match source {
-            Source::Mic => self.mic.extend(samples),
-            Source::SinkMonitor => self.sys.extend(samples),
-        }
-        let ready = self.mic.len().min(self.sys.len());
-        for (a, b) in self.mic.drain(..ready).zip(self.sys.drain(..ready)) {
-            self.writer.write_sample(mix(a, b))?;
+            Source::Mic => {
+                for s in samples {
+                    let sum = self
+                        .sys
+                        .iter_mut()
+                        .filter_map(VecDeque::pop_front)
+                        .fold(s as i32, |acc, x| acc + x as i32);
+                    self.writer.write_sample(clamp(sum))?;
+                }
+            }
+            Source::SinkMonitor(i) => {
+                let q = &mut self.sys[i];
+                q.extend(samples);
+                if q.len() > SYS_QUEUE_CAP {
+                    q.drain(..q.len() - SYS_QUEUE_CAP);
+                }
+            }
         }
         Ok(())
     }
 
-    /// Дописывает хвост более длинной дорожки и закрывает файл.
+    /// Дописывает несведённые хвосты мониторов и закрывает файл.
     fn finalize(mut self) -> Result<()> {
-        for s in self.mic.drain(..).chain(self.sys.drain(..)) {
-            self.writer.write_sample(s)?;
+        while self.sys.iter().any(|q| !q.is_empty()) {
+            let sum = self
+                .sys
+                .iter_mut()
+                .filter_map(VecDeque::pop_front)
+                .fold(0i32, |acc, x| acc + x as i32);
+            self.writer.write_sample(clamp(sum))?;
         }
         self.writer.finalize()?;
         Ok(())
     }
 }
 
-fn mix(a: i16, b: i16) -> i16 {
-    (a as i32 + b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+fn clamp(sum: i32) -> i16 {
+    sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 /// Параметры одной записи.
@@ -160,13 +186,17 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None).context("не удалось подключиться к PipeWire")?;
 
-    let mixer = Rc::new(RefCell::new(Mixer::create(&cfg.wav, cfg.mic_only)?));
-    let mic_stream = capture_stream(&core, Source::Mic, mixer.clone())?;
-    let sys_stream = if cfg.mic_only {
-        None
-    } else {
-        Some(capture_stream(&core, Source::SinkMonitor, mixer.clone())?)
-    };
+    // приложения могут играть не в дефолтный выход (WirePlumber помнит
+    // маршруты per-приложение) — поэтому пишем мониторы всех выходов сразу
+    let sink_ids = if cfg.mic_only { Vec::new() } else { audio_sinks(&mainloop, &core)? };
+
+    let mixer = Rc::new(RefCell::new(Mixer::create(&cfg.wav, sink_ids.len())?));
+    let mic_stream = capture_stream(&core, Source::Mic, None, mixer.clone())?;
+    let sys_streams = sink_ids
+        .iter()
+        .enumerate()
+        .map(|(i, name)| capture_stream(&core, Source::SinkMonitor(i), Some(name), mixer.clone()))
+        .collect::<Result<Vec<_>>>()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
@@ -193,11 +223,56 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
     mainloop.run();
 
     // стримы держат клоны mixer — отпускаем их, чтобы забрать его целиком
-    drop((mic_stream, sys_stream));
+    drop((mic_stream, sys_streams));
     Rc::try_unwrap(mixer)
         .map_err(|_| anyhow::anyhow!("mixer всё ещё используется"))?
         .into_inner()
         .finalize()
+}
+
+/// node.name всех аудиовыходов (нод с media.class == Audio/Sink) на момент
+/// вызова. Появившиеся уже во время записи выходы не захватываются.
+fn audio_sinks(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc) -> Result<Vec<String>> {
+    let registry = core.get_registry().context("PipeWire registry")?;
+    let sinks = Rc::new(RefCell::new(Vec::new()));
+    let done = Rc::new(Cell::new(false));
+    // sync-roundtrip: когда сервер ответит done, все существующие глобальные
+    // объекты уже проехали через global-колбэк
+    let pending = core.sync(0).context("PipeWire sync")?;
+    let _core_listener = core
+        .add_listener_local()
+        .done({
+            let done = done.clone();
+            let mainloop = mainloop.clone();
+            move |id, seq| {
+                if id == pw::core::PW_ID_CORE && seq == pending {
+                    done.set(true);
+                    mainloop.quit();
+                }
+            }
+        })
+        .register();
+    let _registry_listener = registry
+        .add_listener_local()
+        .global({
+            let sinks = sinks.clone();
+            move |global| {
+                let Some(props) = global.props.as_ref().map(|p| p.as_ref()) else { return };
+                if global.type_ == ObjectType::Node
+                    && props.get("media.class") == Some("Audio/Sink")
+                {
+                    if let Some(name) = props.get("node.name") {
+                        sinks.borrow_mut().push(name.to_string());
+                    }
+                }
+            }
+        })
+        .register();
+    while !done.get() {
+        mainloop.run();
+    }
+    let ids = sinks.borrow().clone();
+    Ok(ids)
 }
 
 type StreamHandle<'c> = (pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>);
@@ -205,7 +280,8 @@ type StreamHandle<'c> = (pw::stream::StreamBox<'c>, pw::stream::StreamListener<(
 fn capture_stream<'c>(
     core: &'c pw::core::CoreRc,
     source: Source,
-    mixer: Rc<RefCell<Mixer>>,
+    target: Option<&str>,
+    mixer: Rc<RefCell<FileMixer>>,
 ) -> Result<StreamHandle<'c>> {
     let mut props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -214,8 +290,13 @@ fn capture_stream<'c>(
     };
     let name = match source {
         Source::Mic => "throisma-mic",
-        Source::SinkMonitor => {
+        Source::SinkMonitor(_) => {
             props.insert("stream.capture.sink", "true");
+            // числовой target в connect() у современного PipeWire не работает
+            // (трактуется как object.serial) — таргетим по node.name
+            if let Some(target) = target {
+                props.insert("target.object", target);
+            }
             "throisma-sys"
         }
     };
@@ -266,4 +347,85 @@ fn whisper_format_pod() -> Vec<u8> {
     .expect("сериализация формата в память не падает")
     .0
     .into_inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Прогоняет сценарий через миксер с файлом во временном каталоге и
+    /// возвращает записанные сэмплы.
+    fn run(name: &str, n_sinks: usize, scenario: impl FnOnce(&mut FileMixer)) -> Vec<i16> {
+        let path = std::env::temp_dir()
+            .join(format!("throisma-mixer-{name}-{}.wav", std::process::id()));
+        let mut mixer = Mixer::create(&path, n_sinks).unwrap();
+        scenario(&mut mixer);
+        mixer.finalize().unwrap();
+        let samples = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+        samples
+    }
+
+    #[test]
+    fn mic_only_passthrough() {
+        let out = run("mic-only", 0, |m| {
+            m.push(Source::Mic, [1i16, -2, 3].into_iter()).unwrap();
+        });
+        assert_eq!(out, [1, -2, 3]);
+    }
+
+    #[test]
+    fn mixes_available_sink_samples() {
+        let out = run("mix", 1, |m| {
+            m.push(Source::SinkMonitor(0), [10i16, 20, 30].into_iter()).unwrap();
+            m.push(Source::Mic, [1i16, 2, 3].into_iter()).unwrap();
+        });
+        assert_eq!(out, [11, 22, 33]);
+    }
+
+    #[test]
+    fn silent_sink_does_not_stall_mic() {
+        // регрессия: suspended-выход не производит сэмплов — микрофон всё
+        // равно должен писаться сразу, а не копиться до finalize
+        let out = run("silent-sink", 2, |m| {
+            m.push(Source::Mic, [1i16, 2, 3].into_iter()).unwrap();
+        });
+        assert_eq!(out, [1, 2, 3]);
+    }
+
+    #[test]
+    fn sink_tails_are_summed_on_finalize() {
+        let out = run("tails", 2, |m| {
+            m.push(Source::SinkMonitor(0), [5i16, 5].into_iter()).unwrap();
+            m.push(Source::SinkMonitor(1), [7i16].into_iter()).unwrap();
+        });
+        assert_eq!(out, [12, 5]);
+    }
+
+    #[test]
+    fn clamps_overflow() {
+        let out = run("clamp", 1, |m| {
+            m.push(Source::SinkMonitor(0), [i16::MAX].into_iter()).unwrap();
+            m.push(Source::Mic, [i16::MAX].into_iter()).unwrap();
+        });
+        assert_eq!(out, [i16::MAX]);
+    }
+
+    #[test]
+    fn sink_queue_is_capped() {
+        let out = run("cap", 1, |m| {
+            // 3 «старых» сэмпла + полный кап «новых»: старые должны отпасть
+            let samples = std::iter::repeat(111i16)
+                .take(3)
+                .chain(std::iter::repeat(222i16).take(SYS_QUEUE_CAP));
+            m.push(Source::SinkMonitor(0), samples).unwrap();
+            m.push(Source::Mic, [0i16].into_iter()).unwrap();
+        });
+        assert_eq!(out[0], 222);
+        assert_eq!(out.len(), SYS_QUEUE_CAP); // 1 с микрофоном + хвост
+    }
 }
