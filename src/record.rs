@@ -138,19 +138,25 @@ pub fn record(no_notify: bool) -> Result<()> {
     let notifier = Notifier::new(no_notify);
     let wav = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
-    println!(
-        "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
-        wav.display()
-    );
-    notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
-    record_to(&RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() })?;
+    record_to(
+        &RecordConfig { wav: wav.clone(), mic_only: false, pidfile: paths::pidfile() },
+        || {
+            println!(
+                "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
+                wav.display()
+            );
+            notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
+        },
+    )?;
     println!("Готово: {}", wav.display());
     notifier.send("Готово", &wav.display().to_string());
     Ok(())
 }
 
-/// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Молчалива: вывод — забота вызывающего.
-pub(crate) fn record_to(cfg: &RecordConfig) -> Result<()> {
+/// Пишет звук в cfg.wav до SIGTERM/Ctrl+C. Сама молчалива: вывод — забота
+/// вызывающего; `on_started` вызывается, когда запись реально пошла (стримы
+/// подключены, pid-файл создан).
+pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("PipeWire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -186,6 +192,7 @@ pub(crate) fn record_to(cfg: &RecordConfig) -> Result<()> {
         .into_result()?;
 
     let _pidfile = Pidfile::create(cfg.pidfile.clone())?;
+    on_started();
     mainloop.run();
 
     // стримы держат клоны mixer — отпускаем их, чтобы забрать его целиком
