@@ -37,10 +37,19 @@ pub fn dictate(model: Option<PathBuf>, lang: &str, no_notify: bool) -> Result<()
     notifier.send("Транскрибирую…", "");
     let result = transcribe::transcribe_wav(&wav, model, lang).and_then(|text| {
         let text = text.trim().to_string();
-        insert::insert_text(&text)?;
+        if !text.is_empty() {
+            insert::insert_text(&text)?;
+        }
         Ok(text)
     });
     match result {
+        // тишина: клипборд не трогаем, «Вставлено» не сообщаем
+        Ok(text) if text.is_empty() => {
+            let _ = std::fs::remove_file(&wav);
+            notifier.send("Речь не распознана", "Пустая транскрипция — ничего не вставлено");
+            println!("Речь не распознана — ничего не вставлено.");
+            Ok(())
+        }
         Ok(text) => {
             let _ = std::fs::remove_file(&wav);
             notifier.send("Вставлено", &preview(&text));
