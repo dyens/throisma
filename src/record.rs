@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Пишем сразу в формате whisper: 16 кГц, моно, s16 — ресемплит сам PipeWire.
+/// Пишем сразу в частоте whisper: 16 кГц s16 — ресемплит сам PipeWire.
 const RATE: u32 = 16_000;
 
 /// Откуда захватываем звук.
@@ -89,9 +89,10 @@ impl Drop for Pidfile {
     }
 }
 
-/// Копит дорожки (микрофон и, для встреч, системный звук) и пишет их сумму
-/// в WAV по мере поступления: очередной сэмпл уходит в файл, как только он
-/// есть во всех дорожках.
+/// Копит дорожки (микрофон и, для встреч, системный звук) и пишет их в WAV
+/// раздельными каналами по мере поступления: кадр уходит в файл, как только
+/// очередной сэмпл есть в каждой дорожке. Дорожка 0 (микрофон) — левый канал,
+/// дорожка 1 (системный звук) — правый.
 struct Mixer {
     tracks: Vec<VecDeque<i16>>,
     writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
@@ -100,7 +101,7 @@ struct Mixer {
 impl Mixer {
     fn create(path: &Path, n_tracks: usize) -> Result<Mixer> {
         let spec = hound::WavSpec {
-            channels: 1,
+            channels: n_tracks as u16,
             sample_rate: RATE,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
@@ -115,34 +116,23 @@ impl Mixer {
         self.tracks[track].extend(samples);
         let ready = self.tracks.iter().map(VecDeque::len).min().unwrap_or(0);
         for _ in 0..ready {
-            let sum: i32 = self
-                .tracks
-                .iter_mut()
-                .map(|q| q.pop_front().expect("длина проверена через ready") as i32)
-                .sum();
-            self.writer.write_sample(clamp(sum))?;
+            for q in &mut self.tracks {
+                self.writer.write_sample(q.pop_front().expect("длина проверена через ready"))?;
+            }
         }
         Ok(())
     }
 
-    /// Дописывает несведённые хвосты дорожек и закрывает файл.
+    /// Дописывает хвосты дорожек (недостающие каналы — тишиной) и закрывает файл.
     fn finalize(mut self) -> Result<()> {
         while self.tracks.iter().any(|q| !q.is_empty()) {
-            let sum: i32 = self
-                .tracks
-                .iter_mut()
-                .filter_map(VecDeque::pop_front)
-                .map(i32::from)
-                .sum();
-            self.writer.write_sample(clamp(sum))?;
+            for q in &mut self.tracks {
+                self.writer.write_sample(q.pop_front().unwrap_or(0))?;
+            }
         }
         self.writer.finalize()?;
         Ok(())
     }
-}
-
-fn clamp(sum: i32) -> i16 {
-    sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 /// Параметры одной записи.
@@ -284,4 +274,60 @@ fn whisper_format_pod() -> Vec<u8> {
     .expect("сериализация формата в память не падает")
     .0
     .into_inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Прогоняет сценарий через миксер с файлом во временном каталоге и
+    /// возвращает записанные сэмплы (интерливинг каналов как в файле).
+    fn run(name: &str, n_tracks: usize, scenario: impl FnOnce(&mut Mixer)) -> Vec<i16> {
+        let path = std::env::temp_dir()
+            .join(format!("throisma-mixer-{name}-{}.wav", std::process::id()));
+        let mut mixer = Mixer::create(&path, n_tracks).unwrap();
+        scenario(&mut mixer);
+        mixer.finalize().unwrap();
+        let samples = hound::WavReader::open(&path)
+            .unwrap()
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+        samples
+    }
+
+    #[test]
+    fn mono_passthrough() {
+        let out = run("mono", 1, |m| {
+            m.push(0, [1i16, -2, 3].into_iter()).unwrap();
+        });
+        assert_eq!(out, [1, -2, 3]);
+    }
+
+    #[test]
+    fn stereo_interleaves_tracks() {
+        let out = run("stereo", 2, |m| {
+            m.push(1, [10i16, 20].into_iter()).unwrap();
+            m.push(0, [1i16, 2].into_iter()).unwrap();
+        });
+        assert_eq!(out, [1, 10, 2, 20]);
+    }
+
+    #[test]
+    fn lone_track_flushed_with_silence_on_finalize() {
+        let out = run("lone", 2, |m| {
+            m.push(0, [1i16, 2].into_iter()).unwrap();
+        });
+        assert_eq!(out, [1, 0, 2, 0]);
+    }
+
+    #[test]
+    fn uneven_tails_padded() {
+        let out = run("tails", 2, |m| {
+            m.push(0, [1i16, 2].into_iter()).unwrap();
+            m.push(1, [10i16].into_iter()).unwrap();
+        });
+        assert_eq!(out, [1, 10, 2, 0]);
+    }
 }
