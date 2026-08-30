@@ -7,6 +7,7 @@ mod play;
 mod proc;
 mod record;
 mod transcribe;
+mod tray;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};

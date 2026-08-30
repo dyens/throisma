@@ -1,5 +1,6 @@
 use crate::notify::Notifier;
 use crate::paths;
+use crate::tray::RecordingIcon;
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -7,13 +8,13 @@ use pipewire as pw;
 use pw::spa;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::Pod;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Пишем сразу в частоте whisper: 16 кГц s16 — ресемплит сам PipeWire.
 const RATE: u32 = 16_000;
@@ -140,6 +141,9 @@ pub(crate) struct RecordConfig {
     pub(crate) wav: PathBuf,
     /// Только микрофон (диктовка) или микрофон + системный звук (встречи).
     pub(crate) mic_only: bool,
+    /// Держать значок в трее: для встреч, которые идут часами. Диктовке он
+    /// не нужен — она длится секунды.
+    pub(crate) tray: bool,
 }
 
 pub fn record(no_notify: bool) -> Result<()> {
@@ -147,9 +151,9 @@ pub fn record(no_notify: bool) -> Result<()> {
     let wav = paths::recordings_dir()?
         .join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S.wav").to_string());
     let _pidfile = Pidfile::create(paths::pidfile())?;
-    record_to(&RecordConfig { wav: wav.clone(), mic_only: false }, || {
+    record_to(&RecordConfig { wav: wav.clone(), mic_only: false, tray: true }, || {
         println!(
-            "Идёт запись (микрофон + системный звук) в {} — Ctrl+C или `throisma toggle` для остановки.",
+            "Идёт запись (микрофон + системный звук) в {} — Ctrl+C, клик по значку в трее или `throisma toggle` для остановки.",
             wav.display()
         );
         notifier.send("⏺ Идёт запись встречи", &wav.display().to_string());
@@ -182,14 +186,26 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
         move || stop.store(true, Ordering::SeqCst)
     })?;
 
+    // значок сам просит остановку через тот же флаг, что и Ctrl+C
+    let tray = cfg.tray.then(|| RecordingIcon::show(&cfg.wav, stop.clone())).flatten();
+
     // pipewire-цикл нельзя прервать из обработчика сигнала напрямую —
     // раз в 100 мс проверяем флаг остановки таймером внутри цикла
+    let started = Instant::now();
     let timer = mainloop.loop_().add_timer({
         let mainloop = mainloop.clone();
         let stop = stop.clone();
+        let shown_secs = Cell::new(u64::MAX);
         move |_| {
             if stop.load(Ordering::SeqCst) {
                 mainloop.quit();
+                return;
+            }
+            // счётчик на значке — раз в секунду, а не каждый тик таймера
+            let Some(tray) = &tray else { return };
+            let secs = started.elapsed().as_secs();
+            if shown_secs.replace(secs) != secs {
+                tray.set_elapsed(secs);
             }
         }
     });
@@ -199,6 +215,9 @@ pub(crate) fn record_to(cfg: &RecordConfig, on_started: impl FnOnce()) -> Result
 
     on_started();
     mainloop.run();
+    // значок живёт в замыкании таймера — убираем его сразу, не дожидаясь
+    // записи хвостов в файл
+    drop(timer);
 
     // стримы держат клоны mixer — отпускаем их, чтобы забрать его целиком
     drop((mic_stream, sys_stream));

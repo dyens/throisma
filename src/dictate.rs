@@ -35,7 +35,7 @@ pub fn dictate(
     // повторный хоткей в этом окне шлёт SIGTERM живому процессу, а не
     // запускает вторую запись поверх того же WAV.
     let _pidfile = Pidfile::create(paths::dictate_pidfile())?;
-    record::record_to(&RecordConfig { wav: wav.clone(), mic_only: true }, || {
+    record::record_to(&RecordConfig { wav: wav.clone(), mic_only: true, tray: false }, || {
         println!(
             "Диктовка в {} — Ctrl+C или `throisma dictate` для остановки.",
             wav.display()
