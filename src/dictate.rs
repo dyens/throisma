@@ -45,7 +45,7 @@ pub fn dictate(
 
     notifier.send("Транскрибирую…", "");
     let result = (|| -> Result<()> {
-        let text = transcribe::transcribe_wav(&wav, model, lang, prompt)?;
+        let text = transcribe::transcribe_wav(&wav, model, lang, prompt, None)?;
         let text = text.trim();
         if is_blank(text) {
             // тишина или только маркеры whisper: клипборд не трогаем

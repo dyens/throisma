@@ -14,6 +14,9 @@ hound = "3.5.1"
 ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
 pipewire = "0.10.0"
+# диаризация канала «Они» (pyannote-сегментация + эмбеддинги голоса); при сборке
+# скачивает готовую статическую библиотеку с GitHub
+sherpa-onnx = "1.13.8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # vulkan: транскрипция на GPU (нужны vulkan-loader-devel и glslc)
